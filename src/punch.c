@@ -1,23 +1,19 @@
 #include <rtems.h>
 #include <assert.h>
 #include <bsp.h>
+#include <rtems/irq-extension.h>
 
 #define PWR_X 0x7070
 #define PWR_Y 0x7071
 #define PUNCH 0x7072
 
 #define HEAD_IS_IN_SAFE_ZONE_LEFT(VAL)  (VAL & 1 << (4))
-#define SAFE_T(VAL)  (VAL & 1 << (6))
+#define HEAD_IS_IN_SAFE_ZONE_TOP(VAL)  (VAL & 1 << (6))
 #define SAFE_B(VAL)  (VAL & 1 << (7))
 #define SAFE_R(VAL)  (VAL & 1 << (5))
 
 #define ENC_X_VAL(VAL)  (VAL & 0b0011)
 #define ENC_Y_VAL(VAL)  ((VAL & 0b1100) >> 2)
-
-#define ENC_X_A(VAL)  (VAL & 1 << (0))
-#define ENC_X_B(VAL)  (VAL & 1 << (1))
-#define ENC_Y_A(VAL)  (VAL & 1 << (2))
-#define ENC_Y_B(VAL)  (VAL & 1 << (3))
 
 #define AXIS_X 0
 #define AXIS_Y 1
@@ -27,12 +23,53 @@
 #define MOVEMENT_LEFT_TOP       -1
 #define MOVEMENT_NOWHERE         0
 #define MOVEMENT_RIGHT_BOTTOM    1
+#define CALIBRATION_CALM_COUNTER_LIMIT 500
 
-static const int CALIBRATION_CALM_COUNTER_LIMIT = 1000;
 struct position{
 	int x;
 	int y;
 };
+
+static struct position pos;
+
+// this is needed for calibration purpose - to remember the previous value of the encoder
+uint8_t OLD_ENC_X = -1;
+uint8_t OLD_ENC_Y = -1;
+
+/**
+ * Decides in which direction the head moves
+ */
+int move_left_bottom(int oldval, int currval)
+{
+	if (oldval == currval) return 0;
+
+	//10, 11, 01, 00
+	if ((oldval == 0b10) && (currval == 0b11)) return 1;
+	if ((oldval == 0b11) && (currval == 0b01)) return 1;
+	if ((oldval == 0b01) && (currval == 0b00)) return 1;
+	if ((oldval == 0b00) && (currval == 0b10)) return 1;
+
+	return -1;
+}
+
+/**
+ * interrupt handler
+ */
+void isr(void *dummy) {
+
+	uint32_t input;
+	i386_inport_byte(0x7070, input);
+
+	uint8_t enc_x = ENC_X_VAL(input);
+	uint8_t enc_y = ENC_Y_VAL(input);
+
+	pos.x -= move_left_bottom(OLD_ENC_X, enc_x);
+	pos.y -= move_left_bottom(OLD_ENC_Y, enc_y);
+
+	OLD_ENC_X = enc_x;
+	OLD_ENC_Y = enc_y;
+
+}
 
 rtems_task Task1(rtems_task_argument ignored) {
 	rtems_status_code status;
@@ -49,125 +86,52 @@ rtems_task Task1(rtems_task_argument ignored) {
 	status = rtems_rate_monotonic_period( period_id, ticks );
 }
 
-int move_right_bottom(int oldval, int currval)
+void is_moving(int *oldval, int currval, int *not_moved)
 {
-	//10, 11, 01, 00
-
-	if ((oldval == 0b10) && (currval == 0b11))
-	{
-		return 1;
-	}
-
-	if ((oldval == 0b11) && (currval == 0b01))
-	{
-		return 1;
-	}
-
-	if ((oldval == 0b01) && (currval == 0b00))
-	{
-		return 1;
-	}
-
-	if ((oldval == 0b00) && (currval == 0b10))
-	{
-		return 1;
-	}
-
-	return 0;
-}
-
-int move_left_top(int oldval, int currval)
-{
-	return move_right_bottom(currval, oldval);
-}
-
-int moves_direction(int oldval, int currval)
-{
-	if (oldval == -1) return MOVEMENT_NOWHERE;
-	if (oldval == currval) return MOVEMENT_NOWHERE;
-
-	if (move_right_bottom(oldval, currval)){
-		return MOVEMENT_RIGHT_BOTTOM;
-	}
-
-	if (move_left_top(oldval, currval)){
-		return MOVEMENT_LEFT_TOP;
-	}
-
-	return MOVEMENT_NOWHERE;
-}
-
-int notice_position_change(int axistype, int oldval, int currval, struct position * p)
-{
-	int change = 0;
-	if (axistype == AXIS_X){
-		change = moves_direction(oldval, currval);
-		p->x -= change;
-	}else if (axistype == AXIS_Y){
-		change = moves_direction(oldval, currval);
-		p->y -= change;
-	}
-
-	return (change != MOVEMENT_NOWHERE);
-}
-
-void notice_calibration_movement_in_safe_zone(uint32_t axis, uint32_t *input, int *oldval, struct position *pos, int *not_moved)
-{
-    i386_outport_byte((axis == AXIS_X ? PWR_X : PWR_Y), 0);
-    int currval = (axis == AXIS_X ? ENC_X_VAL(*input) : ENC_Y_VAL(*input));
-    int moved = notice_position_change(axis, *oldval, currval, pos);
-    if(moved){
-        not_moved = 0;
+    if((*oldval != currval)){
+        *not_moved = 0;
     }else{
-        not_moved++;
+        (*not_moved)++;
     }
     *oldval = currval;
 }
 
-rtems_task Init(rtems_task_argument ignored) {
-	//rtems_status_code status;
-	//rtems_id task_id;
-	//rtems_name task_name = rtems_build_name( 'T', 'A', '1', ' ' );
+/**
+ * Function used to decide whether the head is already in safe zone. If it is, stop the motor and store the current position.
+ * If it is not, continue moving.
+ */
+void calibration_logic(int axis, uint32_t input, int *was_in_safezone, int *safezone_enter, int *oldpos, int *not_moved)
+{
+	int in_safezone = (axis == AXIS_X ? HEAD_IS_IN_SAFE_ZONE_LEFT(input) : HEAD_IS_IN_SAFE_ZONE_TOP(input));
+	int pwr = (axis == AXIS_X ? PWR_X : PWR_Y);
+	int currval = (axis == AXIS_X ? pos.x : pos.y);
 
-	uint32_t input = 0;
-
-	struct position pos;
-	pos.x = -1;
-	pos.y = -1;
-
-	int oldxval = -1;
-	int oldyval = -1;
-
-	int x_not_moved = 0;
-	int y_not_moved = 0;
-
-	while (1){
-		i386_inport_byte(0x7070, input);
-
-		if(HEAD_IS_IN_SAFE_ZONE_LEFT(input) == 0)
+    if(in_safezone == 0)
+	{
+		i386_outport_byte(pwr, CALIBRATION_POWER);
+	}else{
+		if (*was_in_safezone == 0)
 		{
-			i386_outport_byte(PWR_X, CALIBRATION_POWER);
-		}else{
-			notice_calibration_movement_in_safe_zone(AXIS_X, &input, &oldxval, &pos, &x_not_moved);
+			*safezone_enter = currval;
 		}
 
-		if(SAFE_T(input) == 0)
-		{
-			i386_outport_byte(PWR_Y, CALIBRATION_POWER);
-		}else{
-
-			notice_calibration_movement_in_safe_zone(AXIS_Y, &input, &oldyval, &pos, &y_not_moved);
-		}
-
-		if ((x_not_moved > CALIBRATION_CALM_COUNTER_LIMIT) && (y_not_moved > CALIBRATION_CALM_COUNTER_LIMIT))
-		{
-			break;
-		}
+		i386_outport_byte(pwr, 0);
+		is_moving(oldpos, currval, not_moved);
+		*was_in_safezone = 1;
 	}
+}
 
-	printf("%f :: %f\n", pos.x*0.25, pos.y*0.25);
+rtems_task Init(rtems_task_argument ignored) {
 
-	/*status = rtems_task_create(
+	pos.x = 0;
+	pos.y = 0;
+
+	// initialize task and start it
+	rtems_status_code status;
+	rtems_id task_id;
+	rtems_name task_name = rtems_build_name( 'T', 'A', '1', ' ' );
+
+	status = rtems_task_create(
 			task_name, 1, RTEMS_MINIMUM_STACK_SIZE * 2, RTEMS_DEFAULT_MODES,
 			RTEMS_DEFAULT_ATTRIBUTES, &task_id
 	);
@@ -176,7 +140,43 @@ rtems_task Init(rtems_task_argument ignored) {
 	status = rtems_task_start( task_id, Task1, 1 );
 	assert( status == RTEMS_SUCCESSFUL );
 
-	rtems_task_delete(RTEMS_SELF);*/
+	// setup IRQ handler
+	status = rtems_interrupt_handler_install(5, NULL, RTEMS_INTERRUPT_UNIQUE, isr, NULL);
+	assert( status == RTEMS_SUCCESSFUL );
+
+	// calibrate
+	uint32_t input = 0;
+
+	int x_not_moved = 0;
+	int y_not_moved = 0;
+
+	int oldpos_x = 0;
+	int oldpos_y = 0;
+
+	int safezone_enter_x = -1;
+	int safezone_enter_y = -1;
+
+	int was_in_safezone_x = 0;
+	int was_in_safezone_y = 0;
+
+	i386_outport_byte(0x7072, 0b10);
+
+	while (1){
+		i386_inport_byte(0x7070, input);
+
+		calibration_logic(AXIS_X, input, &was_in_safezone_x, &safezone_enter_x, &oldpos_x, &x_not_moved);
+		calibration_logic(AXIS_Y, input, &was_in_safezone_y, &safezone_enter_y, &oldpos_y, &y_not_moved);
+
+		if ((x_not_moved > CALIBRATION_CALM_COUNTER_LIMIT) && (y_not_moved > CALIBRATION_CALM_COUNTER_LIMIT))
+		{
+			break;
+		}
+	}
+
+	pos.x -= safezone_enter_x;
+	pos.y -= safezone_enter_y;
+
+	rtems_task_delete(RTEMS_SELF);
 }
 
 /**************** START OF CONFIGURATION INFORMATION ****************/
