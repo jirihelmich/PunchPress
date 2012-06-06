@@ -25,12 +25,32 @@
 #define MOVEMENT_RIGHT_BOTTOM    1
 #define CALIBRATION_CALM_COUNTER_LIMIT 500
 
+#define MOTOR_SPEED_CONSTANT_POSITION 0.25*0.85
+#define MOTOR_SPEED_CONSTANT_DELTA -0.05
+
+static const int MAXIMAL_MOTOR_POWER = 127;
+static const int MINIMAL_MOTOR_POWER = 21.25;
 struct position{
 	int x;
 	int y;
 };
+typedef struct position postion_t;
 
-static struct position pos;
+/**
+ * current positoin of the head. this is set by the interrupt handler.
+ */
+volatile static postion_t pos;
+
+/**
+ * Where the head should go. This is used by both the planning task and the speed-controlling
+ * task.
+ */
+volatile static postion_t destination;
+
+/**
+ * Old delta for purposes of the speed-controlling task only.
+ */
+static postion_t old_delta;
 
 // this is needed for calibration purpose - to remember the previous value of the encoder
 uint8_t OLD_ENC_X = -1;
@@ -71,6 +91,71 @@ void isr(void *dummy) {
 
 }
 
+/**
+ * Signum function as described on SOF
+ */
+static inline int signum (float num)
+{
+	return (0 < num) - (num < 0);
+}
+
+/**
+ * http://www.go4expert.com/forums/showthread.php?t=8714
+ */
+static inline int abs (int x)
+{
+	int t = x >> 31;
+	// t is -1 if x is negative otherwise it is 0
+
+	return t ^ (x + t);
+}
+
+/**
+ *
+ */
+float saturate(float num)
+{
+	int sgn = signum(num);
+
+	float newval = (sgn == -1 ? -num : num);
+
+	if (newval > MAXIMAL_MOTOR_POWER)
+	{
+		newval = MAXIMAL_MOTOR_POWER;
+	}else if (newval < MINIMAL_MOTOR_POWER)
+	{
+		if (sgn != 0)
+		{
+			newval = MINIMAL_MOTOR_POWER;
+		}
+	}
+
+	if (sgn == -1)
+	{
+		newval = -newval;
+	}
+
+	return newval;
+}
+
+/**
+ *
+ */
+float compute_motor_speed(int delta, int old_delta)
+{
+	/**
+	 * E = G-P
+	 * F = E*Kp+(E-E')*Kd
+	 */
+	float f = (delta*MOTOR_SPEED_CONSTANT_POSITION + abs(delta-old_delta)*MOTOR_SPEED_CONSTANT_DELTA);
+	f = saturate(f);
+	return f;
+}
+
+/**
+ * Task which controls the speed of the head based on current location
+ * and based on where the head has to go.
+ */
 rtems_task Task1(rtems_task_argument ignored) {
 	rtems_status_code status;
 	rtems_id          period_id;
@@ -81,11 +166,44 @@ rtems_task Task1(rtems_task_argument ignored) {
 			&period_id
 	);
 
-	ticks = rtems_clock_get_ticks_per_second() / 500;
+	ticks = rtems_clock_get_ticks_per_second() / 100; // 1000 ms in a second, 1000/100 = 10 -> perform each 10 ms
 
-	status = rtems_rate_monotonic_period( period_id, ticks );
+	/**
+	 * How far away from the target we are?
+	 */
+	postion_t delta;
+
+	while(1)
+	{
+		status = rtems_rate_monotonic_period( period_id, ticks );
+		if(status == RTEMS_TIMEOUT)
+		{
+			break; // this is the end. the system missed a deadline, which is fatal.
+		}
+
+		delta.x = destination.x - pos.x;
+		delta.y = destination.y - pos.y;
+
+		int newx = compute_motor_speed(delta.x, old_delta.x);
+		int newy = compute_motor_speed(delta.y, old_delta.y);
+
+		outport_byte(PWR_X, newx);
+		outport_byte(PWR_Y, newy);
+
+		//printf("Since delta is [%d, %d] and olddelta was [%d, %d], setting speed [%d, %d]. \n", delta.x, delta.y, old_delta.x, old_delta.y, newx, newy);
+
+		old_delta.x = delta.x;
+		old_delta.y = delta.y;
+	}
+
+	printf("ERROR! DEADLINE MISSED IN TASK CONTROLLING SPEED!\n");
 }
 
+/**
+ * Determines if the head has moved since the last check.
+ * If it has not, the not_moved parameter value is increased by one,
+ * if it has, the value is set to 0.
+ */
 void is_moving(int *oldval, int currval, int *not_moved)
 {
     if((*oldval != currval)){
@@ -100,7 +218,7 @@ void is_moving(int *oldval, int currval, int *not_moved)
  * Function used to decide whether the head is already in safe zone. If it is, stop the motor and store the current position.
  * If it is not, continue moving.
  */
-void calibration_logic(int axis, uint32_t input, int *was_in_safezone, int *safezone_enter, int *oldpos, int *not_moved)
+void calibration_logic_axis(int axis, uint32_t input, int *was_in_safezone, int *safezone_enter, int *oldpos, int *not_moved)
 {
 	int in_safezone = (axis == AXIS_X ? HEAD_IS_IN_SAFE_ZONE_LEFT(input) : HEAD_IS_IN_SAFE_ZONE_TOP(input));
 	int pwr = (axis == AXIS_X ? PWR_X : PWR_Y);
@@ -121,31 +239,18 @@ void calibration_logic(int axis, uint32_t input, int *was_in_safezone, int *safe
 	}
 }
 
-rtems_task Init(rtems_task_argument ignored) {
-
-	pos.x = 0;
-	pos.y = 0;
-
-	// initialize task and start it
-	rtems_status_code status;
-	rtems_id task_id;
-	rtems_name task_name = rtems_build_name( 'T', 'A', '1', ' ' );
-
-	status = rtems_task_create(
-			task_name, 1, RTEMS_MINIMUM_STACK_SIZE * 2, RTEMS_DEFAULT_MODES,
-			RTEMS_DEFAULT_ATTRIBUTES, &task_id
-	);
-	assert( status == RTEMS_SUCCESSFUL );
-
-	status = rtems_task_start( task_id, Task1, 1 );
-	assert( status == RTEMS_SUCCESSFUL );
-
-	// setup IRQ handler
-	status = rtems_interrupt_handler_install(5, NULL, RTEMS_INTERRUPT_UNIQUE, isr, NULL);
-	assert( status == RTEMS_SUCCESSFUL );
-
-	// calibrate
-	uint32_t input = 0;
+/**
+ * Calibrate the head to obtain a better location info than "in the middle of nowhere".
+ * Goes to the top-left corner of the work area. While reaching the safe zone, it remembers
+ * the current position and counts the real-world position.
+ *
+ * Since the power to the motor on the appropriate axis is cut off when crossing the safe zone,
+ * the motor will eventually stop. Checks, that the motor stays still for N iterations.
+ * After that, the head really stays still, so no interrupt is triggered, so it is safe
+ * to update the position data structure.
+ */
+void calibrate()
+{
 
 	int x_not_moved = 0;
 	int y_not_moved = 0;
@@ -159,13 +264,16 @@ rtems_task Init(rtems_task_argument ignored) {
 	int was_in_safezone_x = 0;
 	int was_in_safezone_y = 0;
 
+	// enables interrupt (set 2nd bit of port 0x7072 to true)
 	i386_outport_byte(0x7072, 0b10);
 
+	uint32_t input = 0;
 	while (1){
 		i386_inport_byte(0x7070, input);
 
-		calibration_logic(AXIS_X, input, &was_in_safezone_x, &safezone_enter_x, &oldpos_x, &x_not_moved);
-		calibration_logic(AXIS_Y, input, &was_in_safezone_y, &safezone_enter_y, &oldpos_y, &y_not_moved);
+		// set power or detect safe zone for each of the axis
+		calibration_logic_axis(AXIS_X, input, &was_in_safezone_x, &safezone_enter_x, &oldpos_x, &x_not_moved);
+		calibration_logic_axis(AXIS_Y, input, &was_in_safezone_y, &safezone_enter_y, &oldpos_y, &y_not_moved);
 
 		if ((x_not_moved > CALIBRATION_CALM_COUNTER_LIMIT) && (y_not_moved > CALIBRATION_CALM_COUNTER_LIMIT))
 		{
@@ -176,6 +284,50 @@ rtems_task Init(rtems_task_argument ignored) {
 	pos.x -= safezone_enter_x;
 	pos.y -= safezone_enter_y;
 
+	old_delta.x = 0;
+	old_delta.y = 0;
+}
+
+/**
+ * Initial task.
+ *
+ * Enables interrupts, runs calibration and starts up new tasks.
+ *
+ * Delete itself after completion.
+ */
+rtems_task Init(rtems_task_argument ignored) {
+
+	/*
+	 * We do not know, where we are, but we need to initialize the value to get correct behavior.
+	 */
+	pos.x = 0;
+	pos.y = 0;
+
+	// setup IRQ handler
+	rtems_status_code status;
+	status = rtems_interrupt_handler_install(5, NULL, RTEMS_INTERRUPT_UNIQUE, isr, NULL);
+	assert( status == RTEMS_SUCCESSFUL );
+
+	// calibrate
+	calibrate();
+
+	// calibration done, setup new tasks and start them
+	rtems_id task_id;
+	rtems_name task_name = rtems_build_name( 'T', 'A', '1', ' ' );
+
+	status = rtems_task_create(
+			task_name, 1, RTEMS_MINIMUM_STACK_SIZE * 2, RTEMS_DEFAULT_MODES,
+			RTEMS_DEFAULT_ATTRIBUTES, &task_id
+	);
+	assert( status == RTEMS_SUCCESSFUL );
+
+	status = rtems_task_start( task_id, Task1, 1 );
+	assert( status == RTEMS_SUCCESSFUL );
+
+	destination.x = 200/0.25;
+	destination.y = 300/0.25;
+
+	// all done. delete itself.
 	rtems_task_delete(RTEMS_SELF);
 }
 
