@@ -29,7 +29,7 @@
 #define MOTOR_SPEED_CONSTANT_DELTA -0.05
 
 static const int MAXIMAL_MOTOR_POWER = 127;
-static const int MINIMAL_MOTOR_POWER = 21.25;
+static const int MINIMAL_MOTOR_POWER = 18;
 struct position{
 	int x;
 	int y;
@@ -111,7 +111,12 @@ static inline int abs (int x)
 }
 
 /**
+ * makes sure that the value is between -MAXIMAL_MOTOR_POWER and MAXIMAL_MOTOR_POWER
  *
+ * if the value is not equal to 0, it also makes sure that the absolute value of the
+ * input is greater than MINIMAL_MOTOR_POWER
+ *
+ * if any rule is not satisfied, the return value is altered to satisfy the rules
  */
 float saturate(float num)
 {
@@ -139,7 +144,7 @@ float saturate(float num)
 }
 
 /**
- *
+ * tries to determine the best speed at the moment
  */
 float compute_motor_speed(int delta, int old_delta)
 {
@@ -147,7 +152,7 @@ float compute_motor_speed(int delta, int old_delta)
 	 * E = G-P
 	 * F = E*Kp+(E-E')*Kd
 	 */
-	float f = (delta*MOTOR_SPEED_CONSTANT_POSITION + abs(delta-old_delta)*MOTOR_SPEED_CONSTANT_DELTA);
+	float f = ((delta+1)*MOTOR_SPEED_CONSTANT_POSITION + abs(delta-old_delta)*MOTOR_SPEED_CONSTANT_DELTA);
 	f = saturate(f);
 	return f;
 }
