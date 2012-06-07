@@ -23,7 +23,8 @@
 #define STATE_NAVIGATING     1
 #define STATE_PUNCH_READY    2
 #define STATE_PUNCHING       3
-#define STATE_DONE           4
+#define STATE_RETRACT        4
+#define STATE_DONE           5
 
 #define CALIBRATION_POWER		-60
 
@@ -44,6 +45,11 @@ struct position{
 	int y;
 };
 typedef struct position postion_t;
+
+/**
+ *
+ */
+static rtems_id state_semaphore_id;
 
 /**
  *
@@ -180,8 +186,15 @@ float compute_motor_speed(int delta, int old_delta)
 
 void set_status(int status)
 {
+	rtems_status_code status_sem = rtems_semaphore_obtain(state_semaphore_id, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+	if ( status_sem != RTEMS_SUCCESSFUL )
+	{
+		return;
+	}
+
 	PUNCHPRESS_STATE = status;
-	printf("Setting punchpress state to %d\n", status);
+
+	rtems_semaphore_release(state_semaphore_id);
 }
 
 /**
@@ -214,7 +227,17 @@ rtems_task Task1(rtems_task_argument ignored) {
 			break; // this is the end. the system missed a deadline, which is fatal.
 		}
 
-		if (PUNCHPRESS_STATE != STATE_NAVIGATING) continue;
+		rtems_status_code status = rtems_semaphore_obtain(state_semaphore_id, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+		if (status != RTEMS_SUCCESSFUL)
+		{
+			break;
+		}
+
+		int state = PUNCHPRESS_STATE;
+
+		rtems_semaphore_release(state_semaphore_id);
+
+		if (state != STATE_NAVIGATING) continue;
 
 		delta.x = destination.x - pos.x;
 		delta.y = destination.y - pos.y;
@@ -222,7 +245,7 @@ rtems_task Task1(rtems_task_argument ignored) {
 		int newx = compute_motor_speed(delta.x, old_delta.x);
 		int newy = compute_motor_speed(delta.y, old_delta.y);
 
-		if (newx == 0 && newy == 0)
+		if ((newx == 0) && (newy == 0))
 		{
 			standing_cycles_count++;
 		}else
@@ -238,8 +261,6 @@ rtems_task Task1(rtems_task_argument ignored) {
 
 		outport_byte(PWR_X, newx);
 		outport_byte(PWR_Y, newy);
-
-		//printf("Since delta is [%d, %d] and olddelta was [%d, %d], setting speed [%d, %d]. \n", delta.x, delta.y, old_delta.x, old_delta.y, newx, newy);
 
 		old_delta.x = delta.x;
 		old_delta.y = delta.y;
@@ -260,7 +281,7 @@ static void plan_movement(int hole_to_punch, int total_holes_count)
 		destination.y = holes[hole_to_punch][1]*4;
 	}
 
-	printf("Want to punch move to hole no. %d at [%d, %d]\n", hole_to_punch, destination.x, destination.y);
+	//printf("Want to punch move to hole no. %d at [%d, %d]\n", hole_to_punch, destination.x, destination.y);
 
 	set_status(STATE_NAVIGATING);
 }
@@ -272,16 +293,30 @@ void punch(int hole_to_punch, int holes_total_count)
 		set_status(STATE_DONE);
 		return;
 	}
-	//outport_byte(0x7072, 0b1);
+	outport_byte(0x7072, 0b11);
+	rtems_task_wake_after(rtems_clock_get_ticks_per_second()/500);
 	set_status(STATE_PUNCHING);
 }
 
 void control_punch(int * hole_to_punch)
 {
-	//outport_byte(0x7072, 0b0);
-	*hole_to_punch += 1;
+	uint32_t input;
+	inport_byte(0x7071, input);
+	if ((input & 1) == 0){
+		outport_byte(0x7072, 0b10);
+		set_status(STATE_RETRACT);
+		*hole_to_punch += 1;
+	}
+}
 
-	set_status(STATE_READY);
+void control_retract()
+{
+	uint32_t input;
+	inport_byte(0x7071, input);
+	if ((input & 1) == 1)
+	{
+		set_status(STATE_READY);
+	}
 }
 
 void dock()
@@ -314,7 +349,17 @@ rtems_task Task2(rtems_task_argument ignored) {
 
 		int error = 0;
 
-		switch (PUNCHPRESS_STATE)
+		rtems_status_code status = rtems_semaphore_obtain(state_semaphore_id, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+		if (status != RTEMS_SUCCESSFUL)
+		{
+			break;
+		}
+
+		int state = PUNCHPRESS_STATE;
+
+		rtems_semaphore_release(state_semaphore_id);
+
+		switch (state)
 		{
 		case STATE_READY:
 			plan_movement(hole_to_punch, holes_total_count);
@@ -324,6 +369,9 @@ rtems_task Task2(rtems_task_argument ignored) {
 			break;
 		case STATE_PUNCHING:
 			control_punch(&hole_to_punch);
+			break;
+		case STATE_RETRACT:
+			control_retract();
 			break;
 		case STATE_NAVIGATING:
 			break;
@@ -488,6 +536,12 @@ rtems_task Init(rtems_task_argument ignored) {
 
 	// calibrate
 	calibrate();
+
+	rtems_name name = rtems_build_name('S','E','M','1');
+	status = rtems_semaphore_create(name,1,RTEMS_SIMPLE_BINARY_SEMAPHORE,0,&state_semaphore_id);
+
+	assert(status == RTEMS_SUCCESSFUL);
+
 	set_status(STATE_READY);
 	create_and_start_tasks();
 
