@@ -3,43 +3,64 @@
 #include <bsp.h>
 #include <rtems/irq-extension.h>
 
-#define PWR_X 0x7070
-#define PWR_Y 0x7071
-#define PUNCH 0x7072
+/**
+ * out ports
+ */
+#define OUT_PWR_X 0x7070
+#define OUT_PWR_Y 0x7071
+#define OUT_PUNCH_IRQ 0x7072
 
-#define HEAD_IS_IN_SAFE_ZONE_LEFT(VAL)  (VAL & 1 << (4))
-#define HEAD_IS_IN_SAFE_ZONE_TOP(VAL)  (VAL & 1 << (6))
-#define SAFE_B(VAL)  (VAL & 1 << (7))
-#define SAFE_R(VAL)  (VAL & 1 << (5))
-
-#define ENC_X_VAL(VAL)  (VAL & 0b0011)
-#define ENC_Y_VAL(VAL)  ((VAL & 0b1100) >> 2)
+/**
+ * bitwise arithmetic macros
+ */
+#define HEAD_IS_IN_SAFE_ZONE_LEFT(VAL)   (VAL & 1 << (4))
+#define HEAD_IS_IN_SAFE_ZONE_TOP(VAL)    (VAL & 1 << (6))
+#define SAFE_B(VAL)  				     (VAL & 1 << (7))
+#define SAFE_R(VAL)                      (VAL & 1 << (5))
+#define ENC_X_VAL(VAL)                   (VAL & 0b0011)
+#define ENC_Y_VAL(VAL)                   ((VAL & 0b1100) >> 2)
 
 #define AXIS_X 0
 #define AXIS_Y 1
 
-#define STATE_INITIAL       -1
-#define STATE_READY          0
-#define STATE_NAVIGATING     1
-#define STATE_PUNCH_READY    2
-#define STATE_PUNCHING       3
-#define STATE_RETRACT        4
-#define STATE_DONE           5
+/**
+ * Tasks periods [ms]
+ */
+#define TASK1_PERIOD 10
+#define TASK2_PERIOD 50
 
+/**
+ * max speed used for calibration
+ */
 #define CALIBRATION_POWER		-60
 
+/**
+ * movement directions constants
+ */
 #define MOVEMENT_LEFT_TOP       -1
 #define MOVEMENT_NOWHERE         0
 #define MOVEMENT_RIGHT_BOTTOM    1
 
-#define CALIBRATION_CALM_COUNTER_LIMIT 100
+/**
+ * how many cycles should pass to make sure we are stayingtr
+ */
+#define CALIBRATION_CALM_COUNTER_LIMIT      100
 
+/**
+ * magic constants for motor speed computation
+ */
 #define MOTOR_SPEED_CONSTANT_POSITION       0.25*1.15
 #define MOTOR_SPEED_CONSTANT_DELTA          -1.05
 
+/**
+ * motor threshold + max power
+ */
 #define MAXIMAL_MOTOR_POWER 127
 #define MINIMAL_MOTOR_POWER 18
 
+/**
+ * position data structure
+ */
 struct position{
 	int x;
 	int y;
@@ -47,14 +68,9 @@ struct position{
 typedef struct position postion_t;
 
 /**
- *
+ * semaphore guarding the critical sections of code (status R/W)
  */
 static rtems_id state_semaphore_id;
-
-/**
- *
- */
-static int PUNCHPRESS_STATE = STATE_INITIAL;
 
 /**
  * current position of the head. this is set by the interrupt handler.
@@ -62,8 +78,25 @@ static int PUNCHPRESS_STATE = STATE_INITIAL;
 volatile static postion_t pos;
 
 /**
+ * punchpress status list
+ */
+#define STATE_INITIAL        0
+#define STATE_READY          1
+#define STATE_NAVIGATING     2
+#define STATE_PUNCH_READY    3
+#define STATE_PUNCHING       4
+#define STATE_RETRACT        5
+#define STATE_DONE           6
+
+/**
+ * punchpress current state
+ */
+static int PUNCHPRESS_STATE = STATE_INITIAL;
+
+/**
  * Where the head should go. This is used by both the planning task and the speed-controlling
- * task.
+ * task. But the mutual exclusion is made by the punchpress states. If the task is planning,
+ * the second one is not navigating.
  */
 volatile static postion_t destination;
 
@@ -72,6 +105,9 @@ volatile static postion_t destination;
  */
 static postion_t old_delta;
 
+/**
+ * where to punch the holes
+ */
 static int holes[][2] = {
 		{30,20},
 		{120, 30},
@@ -86,7 +122,7 @@ uint8_t OLD_ENC_Y = -1;
 /**
  * Decides in which direction the head moves
  */
-int move_left_bottom(int oldval, int currval)
+int get_direction(int oldval, int currval)
 {
 	if (oldval == currval) return 0;
 
@@ -105,17 +141,16 @@ int move_left_bottom(int oldval, int currval)
 void isr(void *dummy) {
 
 	uint32_t input;
-	i386_inport_byte(0x7070, input);
+	i386_inport_byte(0x7070, input); //read position encoders
 
 	uint8_t enc_x = ENC_X_VAL(input);
 	uint8_t enc_y = ENC_Y_VAL(input);
 
-	pos.x -= move_left_bottom(OLD_ENC_X, enc_x);
-	pos.y -= move_left_bottom(OLD_ENC_Y, enc_y);
+	pos.x -= get_direction(OLD_ENC_X, enc_x);
+	pos.y -= get_direction(OLD_ENC_Y, enc_y);
 
 	OLD_ENC_X = enc_x;
 	OLD_ENC_Y = enc_y;
-
 }
 
 /**
@@ -149,19 +184,22 @@ float saturate(float num)
 {
 	int sgn = signum(num);
 
+	// get absolute value of the float
 	float newval = (sgn == -1 ? -num : num);
 
+	// value is greater than maximal motor power
 	if (newval > MAXIMAL_MOTOR_POWER)
 	{
-		newval = MAXIMAL_MOTOR_POWER;
-	}else if (newval < MINIMAL_MOTOR_POWER)
+		newval = MAXIMAL_MOTOR_POWER; // normalize
+	}else if (newval < MINIMAL_MOTOR_POWER) // threshold check
 	{
-		if (sgn != 0)
+		if (sgn != 0) // means the value is in the interval (0,MAXIMAL_MOTOR_POWER), but not 0 -> increase
 		{
 			newval = MINIMAL_MOTOR_POWER;
 		}
 	}
 
+	// apply sign again
 	if (sgn == -1)
 	{
 		newval = -newval;
@@ -184,6 +222,9 @@ float compute_motor_speed(int delta, int old_delta)
 	return f;
 }
 
+/**
+ * aquire semaphore, set new status, release the semaphore
+ */
 void set_status(int status)
 {
 	rtems_status_code status_sem = rtems_semaphore_obtain(state_semaphore_id, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
@@ -192,9 +233,50 @@ void set_status(int status)
 		return;
 	}
 
+	/**
+	 * CRITICAL SECTION
+	 */
 	PUNCHPRESS_STATE = status;
+	/**
+	 * END OF CRITICAL SECTION
+	 */
 
 	rtems_semaphore_release(state_semaphore_id);
+}
+
+/**
+ * Returns the duration of the period in count of the ticks during the period.
+ */
+static inline rtems_interval get_ticks_for_period(int period)
+{
+	int factor = 1000/period;
+	return rtems_clock_get_ticks_per_second()/factor;
+}
+
+/**
+ * Reads punchpress state safely while using semaphore
+ */
+static inline int read_punchpress_state()
+{
+	// aquire semaphore
+	rtems_status_code status = rtems_semaphore_obtain(state_semaphore_id, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+	if (status != RTEMS_SUCCESSFUL)
+	{
+		return -1;
+	}
+
+	/**
+	 * CRITICAL SECTION
+	 */
+	int state = PUNCHPRESS_STATE;
+	/**
+	 * CRITICAL SECTION END
+	 */
+
+	// release the semaphore
+	rtems_semaphore_release(state_semaphore_id);
+
+	return state;
 }
 
 /**
@@ -210,8 +292,7 @@ rtems_task Task1(rtems_task_argument ignored) {
 			rtems_build_name( 'P', 'E', 'R', '1' ),
 			&period_id
 	);
-
-	ticks = rtems_clock_get_ticks_per_second() / 100; // 1000 ms in a second, 1000/100 = 10 -> perform each 10 ms
+	ticks = get_ticks_for_period(TASK1_PERIOD);
 
 	/**
 	 * How far away from the target we are?
@@ -227,41 +308,38 @@ rtems_task Task1(rtems_task_argument ignored) {
 			break; // this is the end. the system missed a deadline, which is fatal.
 		}
 
-		rtems_status_code status = rtems_semaphore_obtain(state_semaphore_id, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-		if (status != RTEMS_SUCCESSFUL)
-		{
-			break;
-		}
+		int state = read_punchpress_state();
 
-		int state = PUNCHPRESS_STATE;
+		// error while aquiring the semaphore
+		if (state < STATE_INITIAL) break;
 
-		rtems_semaphore_release(state_semaphore_id);
-
+		// we are capable of navigation only. anything else is ignored
 		if (state != STATE_NAVIGATING) continue;
 
+		// compute current delta
 		delta.x = destination.x - pos.x;
 		delta.y = destination.y - pos.y;
 
+		// compute new motors speed
 		int newx = compute_motor_speed(delta.x, old_delta.x);
 		int newy = compute_motor_speed(delta.y, old_delta.y);
 
-		if ((newx == 0) && (newy == 0))
-		{
-			standing_cycles_count++;
-		}else
-		{
-			standing_cycles_count = 0;
-		}
+		// propagate new power
+		outport_byte(OUT_PWR_X, newx);
+		outport_byte(OUT_PWR_Y, newy);
 
+		// increase if standing, reset if moving away
+		standing_cycles_count = (standing_cycles_count+1)*((newx == 0) && (newy == 0));
+
+		// standing for long enaugh
 		if (standing_cycles_count > CALIBRATION_CALM_COUNTER_LIMIT)
 		{
+			// get ready to punch!
 			standing_cycles_count = 0;
 			set_status(STATE_PUNCH_READY);
 		}
 
-		outport_byte(PWR_X, newx);
-		outport_byte(PWR_Y, newy);
-
+		// remember current position
 		old_delta.x = delta.x;
 		old_delta.y = delta.y;
 	}
@@ -269,10 +347,18 @@ rtems_task Task1(rtems_task_argument ignored) {
 	printf("ERROR! DEADLINE MISSED IN TASK CONTROLLING SPEED!\n");
 }
 
+/**
+ * decides where to move next. if there is still a hole to punch, moves over there.
+ * if it does not, moves to [0;0].
+ *
+ * after doing the math, sets the status to STATE_NAVIGATING to let the other task
+ * to move the head
+ */
 static void plan_movement(int hole_to_punch, int total_holes_count)
 {
-	if (total_holes_count<= hole_to_punch)
+	if (total_holes_count <= hole_to_punch)
 	{
+		// nothing to punch, just dock
 		destination.x = 0;
 		destination.y = 0;
 	}else
@@ -281,49 +367,76 @@ static void plan_movement(int hole_to_punch, int total_holes_count)
 		destination.y = holes[hole_to_punch][1]*4;
 	}
 
-	//printf("Want to punch move to hole no. %d at [%d, %d]\n", hole_to_punch, destination.x, destination.y);
-
 	set_status(STATE_NAVIGATING);
 }
 
+/**
+ * perform the actual punching. if the number of the hole is out of range,
+ * we've just docked. so set the status to DONE.
+ *
+ * otherwise, set signal to punch (don't disable interrupts!) and hold
+ * for 2ms
+ */
 void punch(int hole_to_punch, int holes_total_count)
 {
 	if (hole_to_punch >= holes_total_count)
 	{
+		// docked, set status to DONE
 		set_status(STATE_DONE);
 		return;
 	}
-	outport_byte(0x7072, 0b11);
-	rtems_task_wake_after(rtems_clock_get_ticks_per_second()/500);
+
+	// set the punch signal and hold for 2ms
+	outport_byte(OUT_PUNCH_IRQ, 0b11);
+	rtems_task_wake_after(get_ticks_for_period(2));
+
+	// set status PUNCHING (aka the head should be down)
 	set_status(STATE_PUNCHING);
 }
 
+/**
+ * The head should be down or moves to this state. "wait" until
+ * the HEAD_UP signal is false. don't literally wait, just
+ * see if the head is down. If it is, begin retracting and set
+ * RETRACT state.
+ */
 void control_punch(int * hole_to_punch)
 {
 	uint32_t input;
 	inport_byte(0x7071, input);
-	if ((input & 1) == 0){
-		outport_byte(0x7072, 0b10);
-		set_status(STATE_RETRACT);
-		*hole_to_punch += 1;
+
+	if ((input & 1) == 0){ // is head down?
+		outport_byte(OUT_PUNCH_IRQ, 0b10); // begin retract
+		set_status(STATE_RETRACT); // status "head is moving up"
+		*hole_to_punch += 1; // loop to the next hole
 	}
 }
 
+/**
+ * The head is moving up. "Wait" until the head is really up.
+ * Then set status READY to signal we are ready for next hole.
+ */
 void control_retract()
 {
 	uint32_t input;
 	inport_byte(0x7071, input);
-	if ((input & 1) == 1)
+	if ((input & 1) == 1) // is head already UP?
 	{
 		set_status(STATE_READY);
 	}
 }
 
-void dock()
+/**
+ *
+ */
+void docked()
 {
 
 }
 
+/**
+ *
+ */
 rtems_task Task2(rtems_task_argument ignored) {
 	rtems_status_code status;
 	rtems_id          period_id;
@@ -333,10 +446,12 @@ rtems_task Task2(rtems_task_argument ignored) {
 			rtems_build_name( 'P', 'E', 'R', '2' ),
 			&period_id
 	);
+	ticks = get_ticks_for_period(50);
 
-	ticks = rtems_clock_get_ticks_per_second() / 20; // 1000 ms in a second, 1000/20 = 50 -> perform each 50 ms
-
+	// the punching will start with the first hole
 	int hole_to_punch = 0;
+
+	// we are about to punch holes_total_count holes
 	int holes_total_count = 4;
 
 	while(1)
@@ -348,16 +463,8 @@ rtems_task Task2(rtems_task_argument ignored) {
 		}
 
 		int error = 0;
-
-		rtems_status_code status = rtems_semaphore_obtain(state_semaphore_id, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-		if (status != RTEMS_SUCCESSFUL)
-		{
-			break;
-		}
-
-		int state = PUNCHPRESS_STATE;
-
-		rtems_semaphore_release(state_semaphore_id);
+		int state = read_punchpress_state();
+		if (state < STATE_INITIAL) break;
 
 		switch (state)
 		{
@@ -376,6 +483,7 @@ rtems_task Task2(rtems_task_argument ignored) {
 		case STATE_NAVIGATING:
 			break;
 		case STATE_DONE:
+			docked();
 			break;
 		default:
 			error = 1;
@@ -413,7 +521,7 @@ void is_moving(int *oldval, int currval, int *not_moved)
 void calibration_logic_axis(int axis, uint32_t input, int *was_in_safezone, int *safezone_enter, int *oldpos, int *not_moved)
 {
 	int in_safezone = (axis == AXIS_X ? HEAD_IS_IN_SAFE_ZONE_LEFT(input) : HEAD_IS_IN_SAFE_ZONE_TOP(input));
-	int pwr = (axis == AXIS_X ? PWR_X : PWR_Y);
+	int pwr = (axis == AXIS_X ? OUT_PWR_X : OUT_PWR_Y);
 	int currval = (axis == AXIS_X ? pos.x : pos.y);
 
     if(in_safezone == 0)
