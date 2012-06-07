@@ -18,15 +18,15 @@
 #define AXIS_X 0
 #define AXIS_Y 1
 
-#define CALIBRATION_POWER		-34
+#define CALIBRATION_POWER		-60
 
 #define MOVEMENT_LEFT_TOP       -1
 #define MOVEMENT_NOWHERE         0
 #define MOVEMENT_RIGHT_BOTTOM    1
 #define CALIBRATION_CALM_COUNTER_LIMIT 500
 
-#define MOTOR_SPEED_CONSTANT_POSITION 0.25*0.85
-#define MOTOR_SPEED_CONSTANT_DELTA -0.05
+#define MOTOR_SPEED_CONSTANT_POSITION 0.25*1.15
+#define MOTOR_SPEED_CONSTANT_DELTA -1.05
 
 static const int MAXIMAL_MOTOR_POWER = 127;
 static const int MINIMAL_MOTOR_POWER = 18;
@@ -204,6 +204,31 @@ rtems_task Task1(rtems_task_argument ignored) {
 	printf("ERROR! DEADLINE MISSED IN TASK CONTROLLING SPEED!\n");
 }
 
+rtems_task Task2(rtems_task_argument ignored) {
+	rtems_status_code status;
+	rtems_id          period_id;
+	rtems_interval    ticks;
+
+	status = rtems_rate_monotonic_create(
+			rtems_build_name( 'P', 'E', 'R', '2' ),
+			&period_id
+	);
+
+	ticks = rtems_clock_get_ticks_per_second() / 20; // 1000 ms in a second, 1000/20 = 50 -> perform each 50 ms
+
+	while(1)
+	{
+		status = rtems_rate_monotonic_period( period_id, ticks );
+		if(status == RTEMS_TIMEOUT)
+		{
+			break; // this is the end. the system missed a deadline, which is fatal.
+		}
+	}
+
+	printf("ERROR! DEADLINE MISSED IN TASK CONTROLLING SPEED!\n");
+
+}
+
 /**
  * Determines if the head has moved since the last check.
  * If it has not, the not_moved parameter value is increased by one,
@@ -294,6 +319,40 @@ void calibrate()
 }
 
 /**
+ *
+ */
+void create_and_start_tasks()
+{
+	// calibration done, setup new tasks and start them
+	rtems_status_code status;
+	rtems_id task_id;
+	rtems_name task_name = rtems_build_name( 'T', 'A', '1', ' ' );
+
+	status = rtems_task_create(
+			task_name, 1, RTEMS_MINIMUM_STACK_SIZE * 2, RTEMS_DEFAULT_MODES,
+			RTEMS_DEFAULT_ATTRIBUTES, &task_id
+	);
+	assert( status == RTEMS_SUCCESSFUL );
+
+	status = rtems_task_start( task_id, Task1, 1 );
+	assert( status == RTEMS_SUCCESSFUL );
+
+
+	/**************************************************************/
+
+	task_name = rtems_build_name( 'T', 'A', '2', ' ' );
+
+	status = rtems_task_create(
+			task_name, 1, RTEMS_MINIMUM_STACK_SIZE * 2, RTEMS_DEFAULT_MODES,
+			RTEMS_DEFAULT_ATTRIBUTES, &task_id
+	);
+	assert( status == RTEMS_SUCCESSFUL );
+
+	status = rtems_task_start( task_id, Task2, 1 );
+	assert( status == RTEMS_SUCCESSFUL );
+}
+
+/**
  * Initial task.
  *
  * Enables interrupts, runs calibration and starts up new tasks.
@@ -315,19 +374,7 @@ rtems_task Init(rtems_task_argument ignored) {
 
 	// calibrate
 	calibrate();
-
-	// calibration done, setup new tasks and start them
-	rtems_id task_id;
-	rtems_name task_name = rtems_build_name( 'T', 'A', '1', ' ' );
-
-	status = rtems_task_create(
-			task_name, 1, RTEMS_MINIMUM_STACK_SIZE * 2, RTEMS_DEFAULT_MODES,
-			RTEMS_DEFAULT_ATTRIBUTES, &task_id
-	);
-	assert( status == RTEMS_SUCCESSFUL );
-
-	status = rtems_task_start( task_id, Task1, 1 );
-	assert( status == RTEMS_SUCCESSFUL );
+	create_and_start_tasks();
 
 	destination.x = 200/0.25;
 	destination.y = 300/0.25;
@@ -341,7 +388,7 @@ rtems_task Init(rtems_task_argument ignored) {
 #define CONFIGURE_APPLICATION_NEEDS_CONSOLE_DRIVER
 #define CONFIGURE_APPLICATION_NEEDS_CLOCK_DRIVER
 
-#define CONFIGURE_MAXIMUM_TASKS             2
+#define CONFIGURE_MAXIMUM_TASKS             3
 #define CONFIGURE_MAXIMUM_PERIODS           2
 
 #define CONFIGURE_EXTRA_TASK_STACKS (3 * RTEMS_MINIMUM_STACK_SIZE)
