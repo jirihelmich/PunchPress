@@ -70,7 +70,7 @@ typedef struct position postion_t;
 /**
  * semaphore guarding the critical sections of code (status R/W)
  */
-static rtems_id state_semaphore_id;
+volatile static rtems_id state_semaphore_id;
 
 /**
  * current position of the head. this is set by the interrupt handler.
@@ -114,6 +114,9 @@ static int holes[][2] = {
 		{110, 80},
 		{40, 100}
 };
+
+static rtems_id task1_id;
+static rtems_id task2_id;
 
 // this is needed for calibration purpose - to remember the previous value of the encoder
 uint8_t OLD_ENC_X = -1;
@@ -431,6 +434,8 @@ void control_retract()
  */
 void docked()
 {
+	rtems_task_delete(task1_id);
+	rtems_task_delete(task2_id);
 
 }
 
@@ -595,16 +600,15 @@ void create_and_start_tasks()
 {
 	// calibration done, setup new tasks and start them
 	rtems_status_code status;
-	rtems_id task_id;
 	rtems_name task_name = rtems_build_name( 'T', 'A', '1', ' ' );
 
 	status = rtems_task_create(
 			task_name, 1, RTEMS_MINIMUM_STACK_SIZE * 2, RTEMS_DEFAULT_MODES,
-			RTEMS_DEFAULT_ATTRIBUTES, &task_id
+			RTEMS_DEFAULT_ATTRIBUTES, &task1_id
 	);
 	assert( status == RTEMS_SUCCESSFUL );
 
-	status = rtems_task_start( task_id, Task1, 1 );
+	status = rtems_task_start( task1_id, Task1, 1 );
 	assert( status == RTEMS_SUCCESSFUL );
 
 
@@ -614,11 +618,11 @@ void create_and_start_tasks()
 
 	status = rtems_task_create(
 			task_name, 1, RTEMS_MINIMUM_STACK_SIZE * 2, RTEMS_DEFAULT_MODES,
-			RTEMS_DEFAULT_ATTRIBUTES, &task_id
+			RTEMS_DEFAULT_ATTRIBUTES, &task2_id
 	);
 	assert( status == RTEMS_SUCCESSFUL );
 
-	status = rtems_task_start( task_id, Task2, 1 );
+	status = rtems_task_start( task2_id, Task2, 1 );
 	assert( status == RTEMS_SUCCESSFUL );
 }
 
@@ -645,9 +649,9 @@ rtems_task Init(rtems_task_argument ignored) {
 	// calibrate
 	calibrate();
 
+	// create semaphore
 	rtems_name name = rtems_build_name('S','E','M','1');
 	status = rtems_semaphore_create(name,1,RTEMS_SIMPLE_BINARY_SEMAPHORE,0,&state_semaphore_id);
-
 	assert(status == RTEMS_SUCCESSFUL);
 
 	set_status(STATE_READY);
