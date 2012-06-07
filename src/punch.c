@@ -18,18 +18,27 @@
 #define AXIS_X 0
 #define AXIS_Y 1
 
+#define STATE_INITIAL       -1
+#define STATE_READY          0
+#define STATE_NAVIGATING     1
+#define STATE_PUNCH_READY    2
+#define STATE_PUNCHING       3
+#define STATE_DONE           4
+
 #define CALIBRATION_POWER		-60
 
 #define MOVEMENT_LEFT_TOP       -1
 #define MOVEMENT_NOWHERE         0
 #define MOVEMENT_RIGHT_BOTTOM    1
-#define CALIBRATION_CALM_COUNTER_LIMIT 500
 
-#define MOTOR_SPEED_CONSTANT_POSITION 0.25*1.15
-#define MOTOR_SPEED_CONSTANT_DELTA -1.05
+#define CALIBRATION_CALM_COUNTER_LIMIT 100
 
-static const int MAXIMAL_MOTOR_POWER = 127;
-static const int MINIMAL_MOTOR_POWER = 18;
+#define MOTOR_SPEED_CONSTANT_POSITION       0.25*1.15
+#define MOTOR_SPEED_CONSTANT_DELTA          -1.05
+
+#define MAXIMAL_MOTOR_POWER 127
+#define MINIMAL_MOTOR_POWER 18
+
 struct position{
 	int x;
 	int y;
@@ -37,7 +46,12 @@ struct position{
 typedef struct position postion_t;
 
 /**
- * current positoin of the head. this is set by the interrupt handler.
+ *
+ */
+static int PUNCHPRESS_STATE = STATE_INITIAL;
+
+/**
+ * current position of the head. this is set by the interrupt handler.
  */
 volatile static postion_t pos;
 
@@ -51,6 +65,13 @@ volatile static postion_t destination;
  * Old delta for purposes of the speed-controlling task only.
  */
 static postion_t old_delta;
+
+static int holes[][2] = {
+		{30,20},
+		{120, 30},
+		{110, 80},
+		{40, 100}
+};
 
 // this is needed for calibration purpose - to remember the previous value of the encoder
 uint8_t OLD_ENC_X = -1;
@@ -157,6 +178,12 @@ float compute_motor_speed(int delta, int old_delta)
 	return f;
 }
 
+void set_status(int status)
+{
+	PUNCHPRESS_STATE = status;
+	printf("Setting punchpress state to %d\n", status);
+}
+
 /**
  * Task which controls the speed of the head based on current location
  * and based on where the head has to go.
@@ -177,6 +204,7 @@ rtems_task Task1(rtems_task_argument ignored) {
 	 * How far away from the target we are?
 	 */
 	postion_t delta;
+	int standing_cycles_count = 0;
 
 	while(1)
 	{
@@ -186,11 +214,27 @@ rtems_task Task1(rtems_task_argument ignored) {
 			break; // this is the end. the system missed a deadline, which is fatal.
 		}
 
+		if (PUNCHPRESS_STATE != STATE_NAVIGATING) continue;
+
 		delta.x = destination.x - pos.x;
 		delta.y = destination.y - pos.y;
 
 		int newx = compute_motor_speed(delta.x, old_delta.x);
 		int newy = compute_motor_speed(delta.y, old_delta.y);
+
+		if (newx == 0 && newy == 0)
+		{
+			standing_cycles_count++;
+		}else
+		{
+			standing_cycles_count = 0;
+		}
+
+		if (standing_cycles_count > CALIBRATION_CALM_COUNTER_LIMIT)
+		{
+			standing_cycles_count = 0;
+			set_status(STATE_PUNCH_READY);
+		}
 
 		outport_byte(PWR_X, newx);
 		outport_byte(PWR_Y, newy);
@@ -202,6 +246,47 @@ rtems_task Task1(rtems_task_argument ignored) {
 	}
 
 	printf("ERROR! DEADLINE MISSED IN TASK CONTROLLING SPEED!\n");
+}
+
+static void plan_movement(int hole_to_punch, int total_holes_count)
+{
+	if (total_holes_count<= hole_to_punch)
+	{
+		destination.x = 0;
+		destination.y = 0;
+	}else
+	{
+		destination.x = holes[hole_to_punch][0]*4;
+		destination.y = holes[hole_to_punch][1]*4;
+	}
+
+	printf("Want to punch move to hole no. %d at [%d, %d]\n", hole_to_punch, destination.x, destination.y);
+
+	set_status(STATE_NAVIGATING);
+}
+
+void punch(int hole_to_punch, int holes_total_count)
+{
+	if (hole_to_punch >= holes_total_count)
+	{
+		set_status(STATE_DONE);
+		return;
+	}
+	//outport_byte(0x7072, 0b1);
+	set_status(STATE_PUNCHING);
+}
+
+void control_punch(int * hole_to_punch)
+{
+	//outport_byte(0x7072, 0b0);
+	*hole_to_punch += 1;
+
+	set_status(STATE_READY);
+}
+
+void dock()
+{
+
 }
 
 rtems_task Task2(rtems_task_argument ignored) {
@@ -216,6 +301,9 @@ rtems_task Task2(rtems_task_argument ignored) {
 
 	ticks = rtems_clock_get_ticks_per_second() / 20; // 1000 ms in a second, 1000/20 = 50 -> perform each 50 ms
 
+	int hole_to_punch = 0;
+	int holes_total_count = 4;
+
 	while(1)
 	{
 		status = rtems_rate_monotonic_period( period_id, ticks );
@@ -223,9 +311,35 @@ rtems_task Task2(rtems_task_argument ignored) {
 		{
 			break; // this is the end. the system missed a deadline, which is fatal.
 		}
+
+		int error = 0;
+
+		switch (PUNCHPRESS_STATE)
+		{
+		case STATE_READY:
+			plan_movement(hole_to_punch, holes_total_count);
+			break;
+		case STATE_PUNCH_READY:
+			punch(hole_to_punch, holes_total_count);
+			break;
+		case STATE_PUNCHING:
+			control_punch(&hole_to_punch);
+			break;
+		case STATE_NAVIGATING:
+			break;
+		case STATE_DONE:
+			break;
+		default:
+			error = 1;
+			break;
+		}
+
+		if (error){
+			break;
+		}
 	}
 
-	printf("ERROR! DEADLINE MISSED IN TASK CONTROLLING SPEED!\n");
+	printf("ERROR! SOMETHING WENT WRONG (UNEXPECTED STATE OR DEADLINE MISSED) IN TASK CONTROLLING PUNCHING!\n");
 
 }
 
@@ -374,10 +488,8 @@ rtems_task Init(rtems_task_argument ignored) {
 
 	// calibrate
 	calibrate();
+	set_status(STATE_READY);
 	create_and_start_tasks();
-
-	destination.x = 200/0.25;
-	destination.y = 300/0.25;
 
 	// all done. delete itself.
 	rtems_task_delete(RTEMS_SELF);
