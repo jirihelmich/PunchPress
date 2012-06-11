@@ -23,6 +23,9 @@
 #define AXIS_X 0
 #define AXIS_Y 1
 
+#define CONTINUE 1
+#define OK       0
+
 /**
  * Tasks periods [ms]
  */
@@ -50,7 +53,7 @@
  * magic constants for motor speed computation
  */
 #define MOTOR_SPEED_CONSTANT_POSITION       0.25*1.15
-#define MOTOR_SPEED_CONSTANT_DELTA          -1.05
+#define MOTOR_SPEED_CONSTANT_DELTA          1.05
 
 /**
  * motor threshold + max power
@@ -65,17 +68,7 @@ struct position{
 	int x;
 	int y;
 };
-typedef struct position postion_t;
-
-/**
- * semaphore guarding the critical sections of code (status R/W)
- */
-volatile static rtems_id state_semaphore_id;
-
-/**
- * current position of the head. this is set by the interrupt handler.
- */
-volatile static postion_t pos;
+typedef struct position position_t;
 
 /**
  * punchpress status list
@@ -98,12 +91,28 @@ static int PUNCHPRESS_STATE = STATE_INITIAL;
  * task. But the mutual exclusion is made by the punchpress states. If the task is planning,
  * the second one is not navigating.
  */
-volatile static postion_t destination;
+volatile static position_t destination;
 
 /**
  * Old delta for purposes of the speed-controlling task only.
  */
-static postion_t old_delta;
+static position_t old_delta;
+
+/**
+ * semaphore guarding the critical sections of code (status R/W)
+ */
+volatile static rtems_id state_semaphore_id;
+
+/**
+ * should we move somewhere?
+ */
+volatile static int newdest = 0;
+
+/**
+ * Field used by ISR to remember position. Updated from init task to
+ * real position when the head stopped moving.
+ */
+volatile static position_t position_isr;
 
 /**
  * where to punch the holes
@@ -115,8 +124,16 @@ static int holes[][2] = {
 		{40, 100}
 };
 
+/**
+ * rtems tasks ids
+ */
 static rtems_id task1_id;
 static rtems_id task2_id;
+
+/**
+ * msg queue id
+ */
+volatile static rtems_id msg_queue;
 
 // this is needed for calibration purpose - to remember the previous value of the encoder
 uint8_t OLD_ENC_X = -1;
@@ -149,8 +166,16 @@ void isr(void *dummy) {
 	uint8_t enc_x = ENC_X_VAL(input);
 	uint8_t enc_y = ENC_Y_VAL(input);
 
-	pos.x -= get_direction(OLD_ENC_X, enc_x);
-	pos.y -= get_direction(OLD_ENC_Y, enc_y);
+	position_isr.x -= get_direction(OLD_ENC_X, enc_x);
+	position_isr.y -= get_direction(OLD_ENC_Y, enc_y);
+
+	rtems_status_code status;
+	uint32_t deleted;
+	status = rtems_message_queue_flush(msg_queue, &deleted); //flush queue - old messages are not relevant from now on
+	assert(status == RTEMS_SUCCESSFUL);
+
+	status = rtems_message_queue_send(msg_queue, (void*)&position_isr, sizeof(position_t)); //write the last position
+	assert(status == RTEMS_SUCCESSFUL);
 
 	OLD_ENC_X = enc_x;
 	OLD_ENC_Y = enc_y;
@@ -220,7 +245,7 @@ float compute_motor_speed(int delta, int old_delta)
 	 * E = G-P
 	 * F = E*Kp+(E-E')*Kd
 	 */
-	float f = ((delta+1)*MOTOR_SPEED_CONSTANT_POSITION + abs(delta-old_delta)*MOTOR_SPEED_CONSTANT_DELTA);
+	float f = (delta+1)/2; //((delta)*MOTOR_SPEED_CONSTANT_POSITION+(delta-old_delta)*MOTOR_SPEED_CONSTANT_DELTA);
 	f = saturate(f);
 	return f;
 }
@@ -283,6 +308,74 @@ static inline int read_punchpress_state()
 }
 
 /**
+ * if we are not moving for a while, set we are ready to punch
+ */
+void set_ready_to_punch_if_standing_long(int *standing_cycles_count)
+{
+    // standing for long enough
+    if (*standing_cycles_count > CALIBRATION_CALM_COUNTER_LIMIT)
+	{
+		// get ready to punch!
+		*standing_cycles_count = 0;
+		set_status(STATE_PUNCH_READY);
+	}
+}
+
+/**
+ * Reads the current position from the ISR message queue. If set, we are moving, OK
+ * is returned. If not set, we are probably not moving. If not moving, increments
+ * the standing_cycles_count and returns CONTINUE. Returns CONTINUE on error.
+ */
+int read_position_from_queue(position_t *pos, int *standing_cycles_count)
+{
+	size_t size;
+	rtems_status_code status;
+	status = rtems_message_queue_receive(msg_queue, pos, &size, RTEMS_NO_WAIT, 0); // read current position from ISR MSG queue
+	if (status == RTEMS_UNSATISFIED) //nothing in the queue => we are not moving!
+	{
+		if (newdest == 0)
+		{
+			(*standing_cycles_count)++;
+		    set_ready_to_punch_if_standing_long(standing_cycles_count);
+		    return CONTINUE;
+		}
+	}else if(status != RTEMS_SUCCESSFUL)
+	{
+		return CONTINUE; //wait for a message
+	}
+	return OK;
+}
+
+/**
+ * Computes the new speed for motors and set it to the device.
+ * Remembers current position in the old_pos field for use in the
+ * next loop.
+ */
+void compute_new_speed_and_set(position_t pos)
+{
+	/**
+	 * How far away from the target we are?
+	 */
+	position_t delta;
+
+    // compute current delta
+    delta.x = destination.x - pos.x;
+    delta.y = destination.y - pos.y;
+
+    // compute new motors speed
+    int newx = compute_motor_speed(delta.x, old_delta.x);
+    int newy = compute_motor_speed(delta.y, old_delta.y);
+
+    // propagate new power
+    outport_byte(OUT_PWR_X, newx);
+    outport_byte(OUT_PWR_Y, newy);
+
+    // remember current position
+    old_delta.x = delta.x;
+    old_delta.y = delta.y;
+}
+
+/**
  * Task which controls the speed of the head based on current location
  * and based on where the head has to go.
  */
@@ -298,10 +391,11 @@ rtems_task Task1(rtems_task_argument ignored) {
 	ticks = get_ticks_for_period(TASK1_PERIOD);
 
 	/**
-	 * How far away from the target we are?
+	 * init variables - how long the head does not move
+	 * done means we are docked
 	 */
-	postion_t delta;
 	int standing_cycles_count = 0;
+	int done = 0;
 
 	while(1)
 	{
@@ -314,40 +408,35 @@ rtems_task Task1(rtems_task_argument ignored) {
 		int state = read_punchpress_state();
 
 		// error while aquiring the semaphore
-		if (state < STATE_INITIAL) break;
-
-		// we are capable of navigation only. anything else is ignored
-		if (state != STATE_NAVIGATING) continue;
-
-		// compute current delta
-		delta.x = destination.x - pos.x;
-		delta.y = destination.y - pos.y;
-
-		// compute new motors speed
-		int newx = compute_motor_speed(delta.x, old_delta.x);
-		int newy = compute_motor_speed(delta.y, old_delta.y);
-
-		// propagate new power
-		outport_byte(OUT_PWR_X, newx);
-		outport_byte(OUT_PWR_Y, newy);
-
-		// increase if standing, reset if moving away
-		standing_cycles_count = (standing_cycles_count+1)*((newx == 0) && (newy == 0));
-
-		// standing for long enaugh
-		if (standing_cycles_count > CALIBRATION_CALM_COUNTER_LIMIT)
-		{
-			// get ready to punch!
-			standing_cycles_count = 0;
-			set_status(STATE_PUNCH_READY);
+		if (state < STATE_INITIAL){
+			break;
+		}else if (state == STATE_DONE) {
+			done = 1;
+			break;
+		}else if (state != STATE_NAVIGATING){
+			// we are capable of navigation only. anything else is ignored
+			continue;
 		}
 
-		// remember current position
-		old_delta.x = delta.x;
-		old_delta.y = delta.y;
+		position_t pos;
+		int read_status = read_position_from_queue(&pos, &standing_cycles_count);
+		if (read_status == CONTINUE) continue;
+
+		standing_cycles_count = 0;
+		newdest = 0;
+
+	    compute_new_speed_and_set(pos);
+	}
+
+	if (done == 1)
+	{
+		rtems_rate_monotonic_delete(period_id);
+		rtems_task_delete(RTEMS_SELF); /* should not return */
+		exit(1);
 	}
 
 	printf("ERROR! DEADLINE MISSED IN TASK CONTROLLING SPEED!\n");
+	exit(1);
 }
 
 /**
@@ -412,6 +501,7 @@ void control_punch(int * hole_to_punch)
 		outport_byte(OUT_PUNCH_IRQ, 0b10); // begin retract
 		set_status(STATE_RETRACT); // status "head is moving up"
 		*hole_to_punch += 1; // loop to the next hole
+		newdest = 1;
 	}
 }
 
@@ -427,16 +517,6 @@ void control_retract()
 	{
 		set_status(STATE_READY);
 	}
-}
-
-/**
- *
- */
-void docked()
-{
-	rtems_task_delete(task1_id);
-	rtems_task_delete(task2_id);
-
 }
 
 /**
@@ -459,6 +539,9 @@ rtems_task Task2(rtems_task_argument ignored) {
 	// we are about to punch holes_total_count holes
 	int holes_total_count = 4;
 
+	int error = 0;
+	int done = 0;
+
 	while(1)
 	{
 		status = rtems_rate_monotonic_period( period_id, ticks );
@@ -466,8 +549,6 @@ rtems_task Task2(rtems_task_argument ignored) {
 		{
 			break; // this is the end. the system missed a deadline, which is fatal.
 		}
-
-		int error = 0;
 		int state = read_punchpress_state();
 		if (state < STATE_INITIAL) break;
 
@@ -488,20 +569,34 @@ rtems_task Task2(rtems_task_argument ignored) {
 		case STATE_NAVIGATING:
 			break;
 		case STATE_DONE:
-			docked();
+			done = 1;
 			break;
 		default:
 			error = 1;
 			break;
 		}
 
-		if (error){
+		if ((error + done) > 0){
 			break;
 		}
 	}
 
-	printf("ERROR! SOMETHING WENT WRONG (UNEXPECTED STATE OR DEADLINE MISSED) IN TASK CONTROLLING PUNCHING!\n");
+	if (error > 0)
+	{
+		printf("ERROR! SOMETHING WENT WRONG (UNEXPECTED STATE OR DEADLINE MISSED) IN TASK CONTROLLING PUNCHING!\n");
+		exit(1);
+	}
 
+	outport_byte(OUT_PUNCH_IRQ, 0);
+	rtems_rate_monotonic_delete(period_id);
+	rtems_semaphore_delete(state_semaphore_id);
+	rtems_interrupt_handler_remove(5, isr, NULL);
+
+	/**
+	 * The only way to shutdown the app is to invoke exit() before deleting the "last" task.
+	 * Since it is not very nice and it is not used in example apps, just delete the task.
+	 **/
+	rtems_task_delete(RTEMS_SELF);
 }
 
 /**
@@ -523,7 +618,7 @@ void is_moving(int *oldval, int currval, int *not_moved)
  * Function used to decide whether the head is already in safe zone. If it is, stop the motor and store the current position.
  * If it is not, continue moving.
  */
-void calibration_logic_axis(int axis, uint32_t input, int *was_in_safezone, int *safezone_enter, int *oldpos, int *not_moved)
+void calibration_logic_axis(int axis, uint32_t input, int *was_in_safezone, int *safezone_enter, int *oldpos, int *not_moved, position_t pos)
 {
 	int in_safezone = (axis == AXIS_X ? HEAD_IS_IN_SAFE_ZONE_LEFT(input) : HEAD_IS_IN_SAFE_ZONE_TOP(input));
 	int pwr = (axis == AXIS_X ? OUT_PWR_X : OUT_PWR_Y);
@@ -572,13 +667,21 @@ void calibrate()
 	// enables interrupt (set 2nd bit of port 0x7072 to true)
 	i386_outport_byte(0x7072, 0b10);
 
+	position_t pos;
+	pos.x = 0;
+	pos.y = 0;
+
 	uint32_t input = 0;
 	while (1){
 		i386_inport_byte(0x7070, input);
 
+		size_t size;
+		rtems_status_code status;
+		status = rtems_message_queue_receive(msg_queue, &pos, &size, RTEMS_NO_WAIT, 0);
+
 		// set power or detect safe zone for each of the axis
-		calibration_logic_axis(AXIS_X, input, &was_in_safezone_x, &safezone_enter_x, &oldpos_x, &x_not_moved);
-		calibration_logic_axis(AXIS_Y, input, &was_in_safezone_y, &safezone_enter_y, &oldpos_y, &y_not_moved);
+		calibration_logic_axis(AXIS_X, input, &was_in_safezone_x, &safezone_enter_x, &oldpos_x, &x_not_moved, pos);
+		calibration_logic_axis(AXIS_Y, input, &was_in_safezone_y, &safezone_enter_y, &oldpos_y, &y_not_moved, pos);
 
 		if ((x_not_moved > CALIBRATION_CALM_COUNTER_LIMIT) && (y_not_moved > CALIBRATION_CALM_COUNTER_LIMIT))
 		{
@@ -586,8 +689,8 @@ void calibrate()
 		}
 	}
 
-	pos.x -= safezone_enter_x;
-	pos.y -= safezone_enter_y;
+	position_isr.x -= safezone_enter_x;
+	position_isr.y -= safezone_enter_y;
 
 	old_delta.x = 0;
 	old_delta.y = 0;
@@ -635,14 +738,17 @@ void create_and_start_tasks()
  */
 rtems_task Init(rtems_task_argument ignored) {
 
-	/*
-	 * We do not know, where we are, but we need to initialize the value to get correct behavior.
-	 */
-	pos.x = 0;
-	pos.y = 0;
+	position_isr.x = 0;
+	position_isr.y = 0;
+
+	rtems_name name;
+	rtems_status_code status;
+
+	name = rtems_build_name('Q','U','E','1');
+	status = rtems_message_queue_create(name, 1, sizeof(position_t), RTEMS_LOCAL, &msg_queue);
+	assert( status == RTEMS_SUCCESSFUL );
 
 	// setup IRQ handler
-	rtems_status_code status;
 	status = rtems_interrupt_handler_install(5, NULL, RTEMS_INTERRUPT_UNIQUE, isr, NULL);
 	assert( status == RTEMS_SUCCESSFUL );
 
@@ -650,7 +756,7 @@ rtems_task Init(rtems_task_argument ignored) {
 	calibrate();
 
 	// create semaphore
-	rtems_name name = rtems_build_name('S','E','M','1');
+	name = rtems_build_name('S','E','M','1');
 	status = rtems_semaphore_create(name,1,RTEMS_SIMPLE_BINARY_SEMAPHORE,0,&state_semaphore_id);
 	assert(status == RTEMS_SUCCESSFUL);
 
@@ -668,6 +774,7 @@ rtems_task Init(rtems_task_argument ignored) {
 
 #define CONFIGURE_MAXIMUM_TASKS             3
 #define CONFIGURE_MAXIMUM_PERIODS           2
+#define CONFIGURE_MAXIMUM_MESSAGE_QUEUES    1
 
 #define CONFIGURE_EXTRA_TASK_STACKS (3 * RTEMS_MINIMUM_STACK_SIZE)
 

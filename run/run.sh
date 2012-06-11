@@ -1,1 +1,1 @@
-qemu -gdb tcp:localhost:10000 -device ers_panel8 -device ers_punch_press,infile=punches.in,outfile=punches.out -icount 8 -m 128 -boot a -fda boot.img -hda fat:./hda --no-reboot -k en-us
+qemu -gdb tcp:localhost:10000 -device ers_punch_press,infile=punches.in,outfile=punches.out -icount 8 -m 128 -boot a -fda boot.img -hda fat:./hda --no-reboot -k en-us
