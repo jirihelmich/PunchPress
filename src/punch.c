@@ -45,15 +45,15 @@
 #define MOVEMENT_RIGHT_BOTTOM    1
 
 /**
- * how many cycles should pass to make sure we are stayingtr
+ * how many cycles should pass to make sure we are staying
  */
 #define CALIBRATION_CALM_COUNTER_LIMIT      100
 
 /**
  * magic constants for motor speed computation
  */
-#define MOTOR_SPEED_CONSTANT_POSITION       0.25*1.15
-#define MOTOR_SPEED_CONSTANT_DELTA          1.05
+#define MOTOR_SPEED_CONSTANT_POSITION       0.25*1.25
+#define MOTOR_SPEED_CONSTANT_DELTA			0
 
 /**
  * motor threshold + max power
@@ -184,7 +184,7 @@ void isr(void *dummy) {
 /**
  * Signum function as described on SOF
  */
-static inline int signum (float num)
+static inline int signum (double num)
 {
 	return (0 < num) - (num < 0);
 }
@@ -208,12 +208,12 @@ static inline int abs (int x)
  *
  * if any rule is not satisfied, the return value is altered to satisfy the rules
  */
-float saturate(float num)
+double saturate(double num)
 {
 	int sgn = signum(num);
 
-	// get absolute value of the float
-	float newval = (sgn == -1 ? -num : num);
+	// get absolute value of the double
+	double newval = (sgn == -1 ? -num : num);
 
 	// value is greater than maximal motor power
 	if (newval > MAXIMAL_MOTOR_POWER)
@@ -239,14 +239,19 @@ float saturate(float num)
 /**
  * tries to determine the best speed at the moment
  */
-float compute_motor_speed(int delta, int old_delta)
+double compute_motor_speed(int delta, int old_delta)
 {
 	/**
 	 * E = G-P
 	 * F = E*Kp+(E-E')*Kd
 	 */
-	float f = (delta+1)/2; //((delta)*MOTOR_SPEED_CONSTANT_POSITION+(delta-old_delta)*MOTOR_SPEED_CONSTANT_DELTA);
+
+	//printk("computing [%d,%d]: ", old_delta, delta);
+
+	double f = ((delta)*MOTOR_SPEED_CONSTANT_POSITION+abs(delta-old_delta)*MOTOR_SPEED_CONSTANT_DELTA);
 	f = saturate(f);
+
+	//printk("%d\n", (int)f);
 	return f;
 }
 
@@ -363,7 +368,9 @@ void compute_new_speed_and_set(position_t pos)
     delta.y = destination.y - pos.y;
 
     // compute new motors speed
+    //printk("x: ");
     int newx = compute_motor_speed(delta.x, old_delta.x);
+    //printk("y: ");
     int newy = compute_motor_speed(delta.y, old_delta.y);
 
     // propagate new power
@@ -455,8 +462,8 @@ static void plan_movement(int hole_to_punch, int total_holes_count)
 		destination.y = 0;
 	}else
 	{
-		destination.x = holes[hole_to_punch][0]*4;
-		destination.y = holes[hole_to_punch][1]*4;
+		destination.x = holes[hole_to_punch][0]*4+1;
+		destination.y = holes[hole_to_punch][1]*4+1;
 	}
 
 	set_status(STATE_NAVIGATING);
