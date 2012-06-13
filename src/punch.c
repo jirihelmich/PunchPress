@@ -42,15 +42,15 @@
 #define MOVEMENT_RIGHT_BOTTOM    1
 
 /**
- * how many cycles should pass to make sure we are stayingtr
+ * how many cycles should pass to make sure we are staying
  */
 #define CALIBRATION_CALM_COUNTER_LIMIT      100
 
 /**
  * magic constants for motor speed computation
  */
-#define MOTOR_SPEED_CONSTANT_POSITION       0.25*1.15
-#define MOTOR_SPEED_CONSTANT_DELTA          -1.05
+#define MOTOR_SPEED_CONSTANT_POSITION       0.25*1.35
+#define MOTOR_SPEED_CONSTANT_DELTA          -0.85
 
 /**
  * motor threshold + max power
@@ -138,6 +138,8 @@ int get_direction(int oldval, int currval)
 	return -1;
 }
 
+volatile static int isrInvocationsNo = 0;
+
 /**
  * interrupt handler
  */
@@ -151,6 +153,7 @@ void isr(void *dummy) {
 
 	pos.x -= get_direction(OLD_ENC_X, enc_x);
 	pos.y -= get_direction(OLD_ENC_Y, enc_y);
+	isrInvocationsNo++;
 
 	OLD_ENC_X = enc_x;
 	OLD_ENC_Y = enc_y;
@@ -220,7 +223,7 @@ float compute_motor_speed(int delta, int old_delta)
 	 * E = G-P
 	 * F = E*Kp+(E-E')*Kd
 	 */
-	float f = ((delta+1)*MOTOR_SPEED_CONSTANT_POSITION + abs(delta-old_delta)*MOTOR_SPEED_CONSTANT_DELTA);
+	float f = ((delta)*MOTOR_SPEED_CONSTANT_POSITION + abs(delta-old_delta)*MOTOR_SPEED_CONSTANT_DELTA);
 	f = saturate(f);
 	return f;
 }
@@ -302,6 +305,7 @@ rtems_task Task1(rtems_task_argument ignored) {
 	 */
 	postion_t delta;
 	int standing_cycles_count = 0;
+	int done = 0;
 
 	while(1)
 	{
@@ -315,6 +319,10 @@ rtems_task Task1(rtems_task_argument ignored) {
 
 		// error while aquiring the semaphore
 		if (state < STATE_INITIAL) break;
+		if (state == STATE_DONE){
+			done = 1;
+			break;
+		}
 
 		// we are capable of navigation only. anything else is ignored
 		if (state != STATE_NAVIGATING) continue;
@@ -334,12 +342,24 @@ rtems_task Task1(rtems_task_argument ignored) {
 		// increase if standing, reset if moving away
 		standing_cycles_count = (standing_cycles_count+1)*((newx == 0) && (newy == 0));
 
-		// standing for long enaugh
+		// standing for long enough
 		if (standing_cycles_count > CALIBRATION_CALM_COUNTER_LIMIT)
 		{
-			// get ready to punch!
-			standing_cycles_count = 0;
-			set_status(STATE_PUNCH_READY);
+			if (pos.x == destination.x && pos.y == destination.y)
+			{
+				// get ready to punch!
+				standing_cycles_count = 0;
+				set_status(STATE_PUNCH_READY);
+			}else{
+				// this does not happen since the head is moving really slowly and
+				// gets to the exact position. But the theoretical possibility
+				// is greater than zero. It is not a very clever approach, how
+				// to retry on getting to a position, but better than nothing.
+				// Also this would not be needed if we had a really good formula
+				// to compute the output power for motors.
+				outport_byte(OUT_PWR_X, MAXIMAL_MOTOR_POWER);
+				outport_byte(OUT_PWR_Y, MAXIMAL_MOTOR_POWER);
+			}
 		}
 
 		// remember current position
@@ -347,7 +367,16 @@ rtems_task Task1(rtems_task_argument ignored) {
 		old_delta.y = delta.y;
 	}
 
+	if (done == 1)
+	{
+		rtems_interrupt_handler_remove(5, isr, NULL);
+		rtems_semaphore_delete(state_semaphore_id);
+		rtems_task_delete(RTEMS_SELF); // should not return!
+		exit(1);
+	}
+
 	printf("ERROR! DEADLINE MISSED IN TASK CONTROLLING SPEED!\n");
+	exit(1);
 }
 
 /**
@@ -362,12 +391,12 @@ static void plan_movement(int hole_to_punch, int total_holes_count)
 	if (total_holes_count <= hole_to_punch)
 	{
 		// nothing to punch, just dock
-		destination.x = 0;
-		destination.y = 0;
+		destination.x = 1;
+		destination.y = 1;
 	}else
 	{
-		destination.x = holes[hole_to_punch][0]*4;
-		destination.y = holes[hole_to_punch][1]*4;
+		destination.x = holes[hole_to_punch][0]*4+1;
+		destination.y = holes[hole_to_punch][1]*4+1;
 	}
 
 	set_status(STATE_NAVIGATING);
@@ -410,6 +439,8 @@ void control_punch(int * hole_to_punch)
 
 	if ((input & 1) == 0){ // is head down?
 		outport_byte(OUT_PUNCH_IRQ, 0b10); // begin retract
+		rtems_task_wake_after(get_ticks_for_period(2));
+
 		set_status(STATE_RETRACT); // status "head is moving up"
 		*hole_to_punch += 1; // loop to the next hole
 	}
@@ -432,16 +463,6 @@ void control_retract()
 /**
  *
  */
-void docked()
-{
-	rtems_task_delete(task1_id);
-	rtems_task_delete(task2_id);
-
-}
-
-/**
- *
- */
 rtems_task Task2(rtems_task_argument ignored) {
 	rtems_status_code status;
 	rtems_id          period_id;
@@ -458,6 +479,7 @@ rtems_task Task2(rtems_task_argument ignored) {
 
 	// we are about to punch holes_total_count holes
 	int holes_total_count = 4;
+	int error = 0;
 
 	while(1)
 	{
@@ -466,8 +488,6 @@ rtems_task Task2(rtems_task_argument ignored) {
 		{
 			break; // this is the end. the system missed a deadline, which is fatal.
 		}
-
-		int error = 0;
 		int state = read_punchpress_state();
 		if (state < STATE_INITIAL) break;
 
@@ -488,7 +508,6 @@ rtems_task Task2(rtems_task_argument ignored) {
 		case STATE_NAVIGATING:
 			break;
 		case STATE_DONE:
-			docked();
 			break;
 		default:
 			error = 1;
@@ -500,30 +519,20 @@ rtems_task Task2(rtems_task_argument ignored) {
 		}
 	}
 
-	printf("ERROR! SOMETHING WENT WRONG (UNEXPECTED STATE OR DEADLINE MISSED) IN TASK CONTROLLING PUNCHING!\n");
+	if (error)
+	{
+		printf("ERROR! SOMETHING WENT WRONG (UNEXPECTED STATE OR DEADLINE MISSED) IN TASK CONTROLLING PUNCHING!\n");
+		exit(1);
+	}
 
-}
-
-/**
- * Determines if the head has moved since the last check.
- * If it has not, the not_moved parameter value is increased by one,
- * if it has, the value is set to 0.
- */
-void is_moving(int *oldval, int currval, int *not_moved)
-{
-    if((*oldval != currval)){
-        *not_moved = 0;
-    }else{
-        (*not_moved)++;
-    }
-    *oldval = currval;
+	rtems_task_delete(RTEMS_SELF);
 }
 
 /**
  * Function used to decide whether the head is already in safe zone. If it is, stop the motor and store the current position.
  * If it is not, continue moving.
  */
-void calibration_logic_axis(int axis, uint32_t input, int *was_in_safezone, int *safezone_enter, int *oldpos, int *not_moved)
+int calibration_logic_axis(int axis, uint32_t input, int *was_in_safezone, int *safezone_enter)
 {
 	int in_safezone = (axis == AXIS_X ? HEAD_IS_IN_SAFE_ZONE_LEFT(input) : HEAD_IS_IN_SAFE_ZONE_TOP(input));
 	int pwr = (axis == AXIS_X ? OUT_PWR_X : OUT_PWR_Y);
@@ -532,15 +541,16 @@ void calibration_logic_axis(int axis, uint32_t input, int *was_in_safezone, int 
     if(in_safezone == 0)
 	{
 		i386_outport_byte(pwr, CALIBRATION_POWER);
+		return CALIBRATION_POWER;
 	}else{
 		if (*was_in_safezone == 0)
 		{
-			*safezone_enter = currval;
+			(*safezone_enter) = currval;
 		}
 
 		i386_outport_byte(pwr, 0);
-		is_moving(oldpos, currval, not_moved);
 		*was_in_safezone = 1;
+		return 0;
 	}
 }
 
@@ -556,10 +566,6 @@ void calibration_logic_axis(int axis, uint32_t input, int *was_in_safezone, int 
  */
 void calibrate()
 {
-
-	int x_not_moved = 0;
-	int y_not_moved = 0;
-
 	int oldpos_x = 0;
 	int oldpos_y = 0;
 
@@ -573,19 +579,35 @@ void calibrate()
 	i386_outport_byte(0x7072, 0b10);
 
 	uint32_t input = 0;
+
+	int not_moved = 0;
 	while (1){
 		i386_inport_byte(0x7070, input);
 
 		// set power or detect safe zone for each of the axis
-		calibration_logic_axis(AXIS_X, input, &was_in_safezone_x, &safezone_enter_x, &oldpos_x, &x_not_moved);
-		calibration_logic_axis(AXIS_Y, input, &was_in_safezone_y, &safezone_enter_y, &oldpos_y, &y_not_moved);
+		int x = calibration_logic_axis(AXIS_X, input, &was_in_safezone_x, &safezone_enter_x);
+		int y = calibration_logic_axis(AXIS_Y, input, &was_in_safezone_y, &safezone_enter_y);
 
-		if ((x_not_moved > CALIBRATION_CALM_COUNTER_LIMIT) && (y_not_moved > CALIBRATION_CALM_COUNTER_LIMIT))
+		if((x+y) != 0) // one of the motors are still moving the head
+		{
+			not_moved = 0; // so we are moving
+		}else{
+			not_moved++; // the head stay still for one more cycle
+		}
+		oldpos_x = pos.x;
+		oldpos_y = pos.y;
+
+		if (not_moved > CALIBRATION_CALM_COUNTER_LIMIT) // staying long enough? continue
 		{
 			break;
 		}
 	}
 
+	// well, the head no longer moves. but the interrupts are still getting processed
+	// from its queue for quite some time on a slow machine, so wait until it is processed
+	rtems_task_wake_after(get_ticks_for_period(1000));
+
+	// we are staying, no interrupts should be coming, reset the position
 	pos.x -= safezone_enter_x;
 	pos.y -= safezone_enter_y;
 
@@ -626,6 +648,59 @@ void create_and_start_tasks()
 	assert( status == RTEMS_SUCCESSFUL );
 }
 
+void benchmark_isr()
+{
+	struct timespec ts, te;
+	rtems_interval tis, tie;
+	uint64_t t1, t2;
+	volatile int x;
+
+	/* Make sure no interrupts are coming – e.g. by IRQ_ON = 0 */
+
+	outport_byte(OUT_PUNCH_IRQ, 0);
+
+	rtems_clock_get_uptime(&ts);
+	tis = rtems_clock_get_ticks_since_boot();
+	printf("Measurement #1 start\n");
+
+	for (x = 0; x < 1500000 ; x++);
+	tie = rtems_clock_get_ticks_since_boot();
+	rtems_clock_get_uptime(&te);
+	t1 = (te.tv_sec - ts.tv_sec) * 1000000 + (te.tv_nsec - ts.tv_nsec) / 1000;
+	printf("Measurement #1 end: %lld us %d ticks\n", t1, tie - tis);
+
+
+	outport_byte(OUT_PUNCH_IRQ, 0b10);
+
+	/* Move head to the top left corner. Then set maximum speed (127) for both axes
+	simultaneously – this yields the highest number of interrupts */
+	rtems_task_wake_after(10);
+
+	outport_byte(OUT_PWR_X, MAXIMAL_MOTOR_POWER);
+	outport_byte(OUT_PWR_Y, MAXIMAL_MOTOR_POWER);
+
+	/* Wait a bit so that the head may get maximum speed */
+	rtems_task_wake_after(10);
+	rtems_clock_get_uptime(&ts);
+	tis = rtems_clock_get_ticks_since_boot();
+	int isrInvNoStart = isrInvocationsNo;
+	printf("Measurement #2 start\n");
+
+	for (x = 0; x < 1500000 ; x++);
+	tie = rtems_clock_get_ticks_since_boot();
+	rtems_clock_get_uptime(&te);
+
+	outport_byte(OUT_PWR_X, 0);
+	outport_byte(OUT_PWR_Y, 0);
+
+	int isrInvNoEnd = isrInvocationsNo;
+	t2 = (te.tv_sec - ts.tv_sec) * 1000000 + (te.tv_nsec - ts.tv_nsec) / 1000;
+	printf("Measurement #2 end: %lld us %d ticks %d ISR invocations\n", t2, tie - tis,
+	isrInvNoEnd - isrInvNoStart);
+
+	printf("Performance impact of %f%%\n", 100 - (double)t1 / t2 * 100);
+}
+
 /**
  * Initial task.
  *
@@ -648,6 +723,7 @@ rtems_task Init(rtems_task_argument ignored) {
 
 	// calibrate
 	calibrate();
+	benchmark_isr();
 
 	// create semaphore
 	rtems_name name = rtems_build_name('S','E','M','1');
