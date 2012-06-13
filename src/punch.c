@@ -4,7 +4,7 @@
 #include <rtems/irq-extension.h>
 #include "holes.h"
 
-#define BENCHMARK 1
+//#define BENCHMARK 1
 
 /**
  * out ports
@@ -447,15 +447,7 @@ void punch(int hole_to_punch, int holes_total_count)
 
 	// set the punch signal and hold for PUNCH_HOLD_PERIOD ms
 	outport_byte(OUT_PUNCH_IRQ, 0b11);
-
-	struct timespec now, later;
-	rtems_clock_get_uptime(&now);
-
 	rtems_task_wake_after(get_ticks_for_period(PUNCH_HOLD_PERIOD));
-
-	rtems_clock_get_uptime(&later);
-
-	printk("punch sleep took %ld usec\n", get_duration(&now, &later));
 
 	// set status PUNCHING (aka the head should be down)
 	set_status(STATE_PUNCHING);
@@ -705,7 +697,7 @@ void create_and_start_tasks()
 	status = rtems_task_start( task2_id, Task2, 1 );
 	assert( status == RTEMS_SUCCESSFUL );
 }
-
+#ifdef BENCHMARK
 void benchmark_isr()
 {
 	struct timespec ts, te;
@@ -758,6 +750,7 @@ void benchmark_isr()
 
 	printf("Performance impact of %f%%\n", 100 - (double)t1 / t2 * 100);
 }
+#endif
 
 /**
  * Initial task.
