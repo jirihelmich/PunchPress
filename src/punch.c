@@ -2,6 +2,9 @@
 #include <assert.h>
 #include <bsp.h>
 #include <rtems/irq-extension.h>
+#include "holes.h"
+
+#define BENCHMARK 1
 
 /**
  * out ports
@@ -28,6 +31,7 @@
  */
 #define TASK1_PERIOD 10
 #define TASK2_PERIOD 50
+#define PUNCH_HOLD_PERIOD 1
 
 /**
  * max speed used for calibration
@@ -105,16 +109,6 @@ volatile static postion_t destination;
  */
 static postion_t old_delta;
 
-/**
- * where to punch the holes
- */
-static int holes[][2] = {
-		{30,20},
-		{120, 30},
-		{110, 80},
-		{40, 100}
-};
-
 static rtems_id task1_id;
 static rtems_id task2_id;
 
@@ -138,12 +132,17 @@ int get_direction(int oldval, int currval)
 	return -1;
 }
 
+#ifdef BENCHMARK
 volatile static int isrInvocationsNo = 0;
+#endif
 
 /**
  * interrupt handler
  */
 void isr(void *dummy) {
+	#ifdef BENCHMARK
+	isrInvocationsNo++;
+	#endif
 
 	uint32_t input;
 	i386_inport_byte(0x7070, input); //read position encoders
@@ -153,7 +152,6 @@ void isr(void *dummy) {
 
 	pos.x -= get_direction(OLD_ENC_X, enc_x);
 	pos.y -= get_direction(OLD_ENC_Y, enc_y);
-	isrInvocationsNo++;
 
 	OLD_ENC_X = enc_x;
 	OLD_ENC_Y = enc_y;
@@ -253,10 +251,9 @@ void set_status(int status)
 /**
  * Returns the duration of the period in count of the ticks during the period.
  */
-static inline rtems_interval get_ticks_for_period(int period)
+static inline rtems_interval get_ticks_for_period(uint32_t period)
 {
-	int factor = 1000/period;
-	return rtems_clock_get_ticks_per_second()/factor;
+	return rtems_clock_get_ticks_per_second()*period/1000;
 }
 
 /**
@@ -285,6 +282,14 @@ static inline int read_punchpress_state()
 	return state;
 }
 
+/***
+ * converts timespec values to usec interval
+ */
+static inline long get_duration(struct timespec *time_start, struct timespec *time_end)
+{
+	return (time_end->tv_sec - time_start->tv_sec)*1000000 + (time_end->tv_nsec - time_start->tv_nsec)/1000;
+}
+
 /**
  * Task which controls the speed of the head based on current location
  * and based on where the head has to go.
@@ -307,14 +312,15 @@ rtems_task Task1(rtems_task_argument ignored) {
 	int standing_cycles_count = 0;
 	int done = 0;
 
+#ifdef BENCHMARK
+	struct timespec time_start;
+	struct timespec time_end;
+	long worstcase = 0;
+	rtems_clock_get_uptime(&time_start);
+#endif
+
 	while(1)
 	{
-		status = rtems_rate_monotonic_period( period_id, ticks );
-		if(status == RTEMS_TIMEOUT)
-		{
-			break; // this is the end. the system missed a deadline, which is fatal.
-		}
-
 		int state = read_punchpress_state();
 
 		// error while aquiring the semaphore
@@ -325,46 +331,67 @@ rtems_task Task1(rtems_task_argument ignored) {
 		}
 
 		// we are capable of navigation only. anything else is ignored
-		if (state != STATE_NAVIGATING) continue;
+		if (state == STATE_NAVIGATING){
+			// compute current delta
+			delta.x = destination.x - pos.x;
+			delta.y = destination.y - pos.y;
 
-		// compute current delta
-		delta.x = destination.x - pos.x;
-		delta.y = destination.y - pos.y;
+			// compute new motors speed
+			int newx = compute_motor_speed(delta.x, old_delta.x);
+			int newy = compute_motor_speed(delta.y, old_delta.y);
 
-		// compute new motors speed
-		int newx = compute_motor_speed(delta.x, old_delta.x);
-		int newy = compute_motor_speed(delta.y, old_delta.y);
+			// propagate new power
+			outport_byte(OUT_PWR_X, newx);
+			outport_byte(OUT_PWR_Y, newy);
 
-		// propagate new power
-		outport_byte(OUT_PWR_X, newx);
-		outport_byte(OUT_PWR_Y, newy);
+			// increase if standing, reset if moving away
+			standing_cycles_count = (standing_cycles_count+1)*((newx == 0) && (newy == 0));
 
-		// increase if standing, reset if moving away
-		standing_cycles_count = (standing_cycles_count+1)*((newx == 0) && (newy == 0));
-
-		// standing for long enough
-		if (standing_cycles_count > CALIBRATION_CALM_COUNTER_LIMIT)
-		{
-			if (pos.x == destination.x && pos.y == destination.y)
+			// standing for long enough
+			if (standing_cycles_count > CALIBRATION_CALM_COUNTER_LIMIT)
 			{
-				// get ready to punch!
-				standing_cycles_count = 0;
-				set_status(STATE_PUNCH_READY);
-			}else{
-				// this does not happen since the head is moving really slowly and
-				// gets to the exact position. But the theoretical possibility
-				// is greater than zero. It is not a very clever approach, how
-				// to retry on getting to a position, but better than nothing.
-				// Also this would not be needed if we had a really good formula
-				// to compute the output power for motors.
-				outport_byte(OUT_PWR_X, MAXIMAL_MOTOR_POWER);
-				outport_byte(OUT_PWR_Y, MAXIMAL_MOTOR_POWER);
+				if (pos.x == destination.x && pos.y == destination.y)
+				{
+					// get ready to punch!
+					standing_cycles_count = 0;
+					set_status(STATE_PUNCH_READY);
+				}else{
+					// this does not happen since the head is moving really slowly and
+					// gets to the exact position. But the theoretical possibility
+					// is greater than zero. It is not a very clever approach, how
+					// to retry on getting to a position, but better than nothing.
+					// Also this would not be needed if we had a really good formula
+					// to compute the output power for motors.
+					outport_byte(OUT_PWR_X, MAXIMAL_MOTOR_POWER);
+					outport_byte(OUT_PWR_Y, MAXIMAL_MOTOR_POWER);
+				}
 			}
+
+			// remember current position
+			old_delta.x = delta.x;
+			old_delta.y = delta.y;
 		}
 
-		// remember current position
-		old_delta.x = delta.x;
-		old_delta.y = delta.y;
+#ifdef BENCHMARK
+		rtems_clock_get_uptime(&time_end);
+		long duration = get_duration(&time_start, &time_end);
+		if (duration > worstcase)
+		{
+			worstcase = duration;
+			printf("We have a new worstcase for Task1: %ld usec.\n", worstcase);
+		}
+#endif
+
+		status = rtems_rate_monotonic_period( period_id, ticks );
+		if(status == RTEMS_TIMEOUT)
+		{
+			break; // this is the end. the system missed a deadline, which is fatal.
+		}
+
+#ifdef BENCHMARK
+		rtems_clock_get_uptime(&time_start);
+#endif
+
 	}
 
 	if (done == 1)
@@ -418,9 +445,17 @@ void punch(int hole_to_punch, int holes_total_count)
 		return;
 	}
 
-	// set the punch signal and hold for 2ms
+	// set the punch signal and hold for PUNCH_HOLD_PERIOD ms
 	outport_byte(OUT_PUNCH_IRQ, 0b11);
-	rtems_task_wake_after(get_ticks_for_period(2));
+
+	struct timespec now, later;
+	rtems_clock_get_uptime(&now);
+
+	rtems_task_wake_after(get_ticks_for_period(PUNCH_HOLD_PERIOD));
+
+	rtems_clock_get_uptime(&later);
+
+	printk("punch sleep took %ld usec\n", get_duration(&now, &later));
 
 	// set status PUNCHING (aka the head should be down)
 	set_status(STATE_PUNCHING);
@@ -439,7 +474,7 @@ void control_punch(int * hole_to_punch)
 
 	if ((input & 1) == 0){ // is head down?
 		outport_byte(OUT_PUNCH_IRQ, 0b10); // begin retract
-		rtems_task_wake_after(get_ticks_for_period(2));
+		rtems_task_wake_after(get_ticks_for_period(PUNCH_HOLD_PERIOD));
 
 		set_status(STATE_RETRACT); // status "head is moving up"
 		*hole_to_punch += 1; // loop to the next hole
@@ -478,16 +513,18 @@ rtems_task Task2(rtems_task_argument ignored) {
 	int hole_to_punch = 0;
 
 	// we are about to punch holes_total_count holes
-	int holes_total_count = 4;
+	int holes_total_count = sizeof(holes)/(2*sizeof(uint32_t));
 	int error = 0;
+
+#ifdef BENCHMARK
+	struct timespec time_start;
+	struct timespec time_end;
+	long worstcase = 0;
+	rtems_clock_get_uptime(&time_start);
+#endif
 
 	while(1)
 	{
-		status = rtems_rate_monotonic_period( period_id, ticks );
-		if(status == RTEMS_TIMEOUT)
-		{
-			break; // this is the end. the system missed a deadline, which is fatal.
-		}
 		int state = read_punchpress_state();
 		if (state < STATE_INITIAL) break;
 
@@ -517,6 +554,27 @@ rtems_task Task2(rtems_task_argument ignored) {
 		if (error){
 			break;
 		}
+
+
+#ifdef BENCHMARK
+		rtems_clock_get_uptime(&time_end);
+		long duration = get_duration(&time_start, &time_end);
+		if (duration > worstcase)
+		{
+			worstcase = duration;
+			printf("We have a new worstcase for Task2: %ld usec.\n", worstcase);
+		}
+#endif
+		status = rtems_rate_monotonic_period( period_id, ticks );
+		if(status == RTEMS_TIMEOUT)
+		{
+			break; // this is the end. the system missed a deadline, which is fatal.
+		}
+
+#ifdef BENCHMARK
+		rtems_clock_get_uptime(&time_start);
+#endif
+
 	}
 
 	if (error)
@@ -723,7 +781,10 @@ rtems_task Init(rtems_task_argument ignored) {
 
 	// calibrate
 	calibrate();
+
+#ifdef BENCHMARK
 	benchmark_isr();
+#endif
 
 	// create semaphore
 	rtems_name name = rtems_build_name('S','E','M','1');
@@ -741,6 +802,7 @@ rtems_task Init(rtems_task_argument ignored) {
 
 #define CONFIGURE_APPLICATION_NEEDS_CONSOLE_DRIVER
 #define CONFIGURE_APPLICATION_NEEDS_CLOCK_DRIVER
+#define CONFIGURE_MICROSECONDS_PER_TICK  1000
 
 #define CONFIGURE_MAXIMUM_TASKS             3
 #define CONFIGURE_MAXIMUM_PERIODS           2
